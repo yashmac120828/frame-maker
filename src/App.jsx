@@ -4,7 +4,7 @@ import 'react-image-crop/dist/ReactCrop.css'
 import { warmUp, removeBg } from './bgClient'
 import { prepareUpload, cropToBlob, blobToPerson } from './compose'
 import Editor from './Editor'
-import LoadingScreen from './LoadingScreen'
+import LoadingScreen from "./Loadingscreen"
 
 export default function App() {
   const fileRef = useRef(null)
