@@ -1,8 +1,10 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import ReactCrop from 'react-image-crop'
 import 'react-image-crop/dist/ReactCrop.css'
-import { removeBackground } from '@imgly/background-removal'
-import { composeFrame, cropToBlob } from './compose'
+import { warmUp, removeBg } from './bgClient'
+import { prepareUpload, cropToBlob, blobToPerson } from './compose'
+import Editor from './Editor'
+import LoadingScreen from './LoadingScreen'
 
 export default function App() {
   const fileRef = useRef(null)
@@ -10,85 +12,83 @@ export default function App() {
 
   const [imageSrc, setImageSrc] = useState(null)
   const [crop, setCrop] = useState()
-  const [done, setDone] = useState(null) // pixel crop (display px)
-  const [stage, setStage] = useState('idle') // idle | crop | processing | result
+  const [done, setDone] = useState(null)
+  const [stage, setStage] = useState('idle') // idle | loading | crop | processing | edit
+  const [phase, setPhase] = useState('compute')
   const [progress, setProgress] = useState(0)
-  const [result, setResult] = useState(null)
+  const [person, setPerson] = useState(null)
+  const [version, setVersion] = useState(0)
   const [notice, setNotice] = useState('')
+  const [modelReady, setModelReady] = useState(false)
 
-  const onFile = (e) => {
+  // SPEED: download the AI model in the background as soon as the page opens
+  useEffect(() => {
+    warmUp().then(() => setModelReady(true))
+  }, [])
+
+  const onFile = async (e) => {
     const file = e.target.files?.[0]
+    e.target.value = ''
     if (!file) return
-    const reader = new FileReader()
-    reader.onload = () => {
-      setImageSrc(reader.result)
+    setStage('loading')
+    try {
+      const url = await prepareUpload(file)
+      if (imageSrc) URL.revokeObjectURL(imageSrc)
+      setImageSrc(url)
       setCrop(undefined)
       setDone(null)
-      setResult(null)
-      setNotice('')
       setStage('crop')
+    } catch (err) {
+      console.error(err)
+      alert('Could not open this photo. Please try another one.')
+      setStage(person ? 'edit' : 'idle')
     }
-    reader.readAsDataURL(file)
-    e.target.value = ''
   }
 
-  // free-form default box (user can resize / move it freely)
   const onImageLoad = (e) => {
+    if (crop) return // keep previous box when re-selecting
     const { width, height } = e.currentTarget
-    const c = { unit: '%', x: 10, y: 5, width: 80, height: 90 }
-    setCrop(c)
-    setDone({
-      unit: 'px',
-      x: width * 0.1,
-      y: height * 0.05,
-      width: width * 0.8,
-      height: height * 0.9,
-    })
+    setCrop({ unit: '%', x: 10, y: 5, width: 80, height: 90 })
+    setDone({ unit: 'px', x: width * 0.1, y: height * 0.05, width: width * 0.8, height: height * 0.9 })
   }
 
   const generate = async () => {
     const img = imgRef.current
     if (!img || !done?.width || !done?.height) return
     setStage('processing')
+    setPhase('compute')
     setProgress(0)
     setNotice('')
 
-    // convert displayed crop -> natural image pixels
     const sx = img.naturalWidth / img.width
     const sy = img.naturalHeight / img.height
-    const px = {
-      x: done.x * sx,
-      y: done.y * sy,
-      width: done.width * sx,
-      height: done.height * sy,
-    }
+    const px = { x: done.x * sx, y: done.y * sy, width: done.width * sx, height: done.height * sy }
 
-    const croppedBlob = await cropToBlob(img, px)
-    let personBlob = croppedBlob
     try {
-      personBlob = await removeBackground(croppedBlob, {
-        output: { format: 'image/png' },
-        progress: (_key, current, total) => {
-          if (total) setProgress(Math.round((current / total) * 100))
-        },
-      })
+      const croppedBlob = await cropToBlob(img, px)
+      let personBlob = croppedBlob
+      try {
+        personBlob = await removeBg(croppedBlob, (key, current, total) => {
+          if (String(key).startsWith('fetch')) {
+            setPhase('fetch')
+            if (total) setProgress(Math.round((current / total) * 100))
+          } else setPhase('compute')
+        })
+      } catch (err) {
+        console.error(err)
+        setNotice('Background could not be removed, so your photo was used as it is.')
+      }
+      setPerson(await blobToPerson(personBlob))
+      setVersion((v) => v + 1)
+      setStage('edit')
     } catch (err) {
       console.error(err)
-      setNotice('Background could not be removed, so your photo was used as it is.')
+      alert('Something went wrong. Please try again.')
+      setStage('crop')
     }
-
-    const url = URL.createObjectURL(personBlob)
-    setResult(await composeFrame(url))
-    URL.revokeObjectURL(url)
-    setStage('result')
   }
 
-  const download = () => {
-    const a = document.createElement('a')
-    a.href = result
-    a.download = 'my-profile-frame.png'
-    a.click()
-  }
+  const cancelCrop = () => setStage(person ? 'edit' : 'idle')
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-amber-50 to-yellow-100 flex flex-col items-center px-4 py-6">
@@ -108,8 +108,13 @@ export default function App() {
           >
             Upload your photo
           </button>
+          <p className="text-xs text-amber-700 text-center">
+            Your photo stays on your phone. Nothing is uploaded.
+          </p>
         </div>
       )}
+
+      {stage === 'loading' && <LoadingScreen title="Opening your photo…" />}
 
       {stage === 'crop' && imageSrc && (
         <div className="w-full max-w-sm flex flex-col gap-4">
@@ -130,13 +135,16 @@ export default function App() {
                 src={imageSrc}
                 alt="Upload"
                 onLoad={onImageLoad}
-                style={{ maxHeight: '65vh' }}
+                style={{ maxHeight: '65vh', maxWidth: '100%' }}
               />
             </ReactCrop>
           </div>
+          {!modelReady && (
+            <p className="text-xs text-amber-700 text-center">Getting the AI ready in the background…</p>
+          )}
           <div className="flex gap-3">
             <button
-              onClick={() => setStage('idle')}
+              onClick={cancelCrop}
               className="flex-1 rounded-full border border-red-800 py-3 text-red-800 font-semibold"
             >
               Cancel
@@ -145,41 +153,29 @@ export default function App() {
               onClick={generate}
               className="flex-1 rounded-full bg-red-800 py-3 text-white font-semibold"
             >
-              Upload
+              Next
             </button>
           </div>
         </div>
       )}
 
       {stage === 'processing' && (
-        <div className="w-full max-w-sm flex flex-col items-center gap-4 mt-10">
-          <div className="h-12 w-12 animate-spin rounded-full border-4 border-red-800 border-t-transparent" />
-          <p className="text-amber-900 font-medium">Removing background…</p>
-          <div className="w-full h-2 rounded-full bg-amber-200 overflow-hidden">
-            <div className="h-full bg-red-800 transition-all" style={{ width: `${progress}%` }} />
-          </div>
-          <p className="text-xs text-amber-700 text-center">
-            First time may take a little longer while the AI model loads.
-          </p>
-        </div>
+        <LoadingScreen
+          title={phase === 'fetch' ? 'Downloading AI (first time only)…' : 'Removing background…'}
+          progress={phase === 'fetch' ? progress : null}
+        />
       )}
 
-      {stage === 'result' && (
-        <div className="w-full max-w-sm flex flex-col items-center gap-5">
-          <img src={result} alt="Your profile" className="w-80 h-80 rounded-full shadow-xl" />
-          {notice && <p className="text-sm text-red-700 text-center">{notice}</p>}
-          <button
-            onClick={download}
-            className="w-full rounded-full bg-red-800 py-3 text-white font-semibold shadow-lg"
-          >
-            Download
-          </button>
-          <button
-            onClick={() => fileRef.current.click()}
-            className="w-full rounded-full border border-red-800 py-3 text-red-800 font-semibold"
-          >
-            Choose another photo
-          </button>
+      {/* Editor stays mounted so edits are not lost when re-selecting the area */}
+      {person && (
+        <div className={stage === 'edit' ? 'w-full flex justify-center' : 'hidden'}>
+          <Editor
+            key={version}
+            initialPerson={person}
+            notice={notice}
+            onChangePhoto={() => fileRef.current.click()}
+            onRecrop={() => setStage('crop')}
+          />
         </div>
       )}
     </div>
